@@ -1,4 +1,4 @@
-"""Minimal Windows tray interface for OBS-backed recording and bookmarking."""
+"""Windows tray controller for OBS-backed recording and on-demand library."""
 from __future__ import annotations
 
 import sys
@@ -136,8 +136,9 @@ class MainWindow(QMainWindow):
         self.obs_folder: str | None = None
         self.hotkeys: HotkeyListener | None = None
         self.has_hidden_once = False
+        self.library_window = None  # Created only when library is opened.
         self.setWindowTitle(APP_TITLE)
-        self.resize(410, 290)
+        self.resize(460, 310)
         self.setMinimumSize(385, 275)
         self.setWindowIcon(tray_icon(False))
         self.build_ui()
@@ -183,6 +184,9 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.bookmark_button)
         layout.addLayout(buttons)
         controls = QHBoxLayout()
+        library_button = QPushButton("Recording library")
+        library_button.clicked.connect(self.open_library)
+        controls.addWidget(library_button)
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self.open_settings)
         folder_button = QPushButton("Open recordings")
@@ -206,6 +210,8 @@ class MainWindow(QMainWindow):
         self.action_bookmark.triggered.connect(lambda: self.submit("bookmark", self.backend.bookmark))
         action_show = QAction("Open dogears", self)
         action_show.triggered.connect(self.show_from_tray)
+        action_library = QAction("Recording library", self)
+        action_library.triggered.connect(self.open_library)
         action_folder = QAction("Open recordings", self)
         action_folder.triggered.connect(self.open_recordings)
         action_quit = QAction("Quit", self)
@@ -214,6 +220,7 @@ class MainWindow(QMainWindow):
             menu.addAction(action)
         menu.addSeparator()
         menu.addAction(action_show)
+        menu.addAction(action_library)
         menu.addAction(action_folder)
         menu.addSeparator()
         menu.addAction(action_quit)
@@ -291,6 +298,8 @@ class MainWindow(QMainWindow):
             self.sounds.play("bookmarked")
         elif result["event"] == "stopped":
             self.last_recording = result["path"]
+            if self.library_window is not None:
+                self.library_window.refresh()
             self.status.setText(f"Saved recording — {result['count']} bookmarks")
             self.sounds.play("stopped")
             if result.get("warning"):
@@ -336,6 +345,25 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Cannot save settings", str(exc))
 
+    def open_library(self):
+        # Lazy import: no video player or decoder runs in the tray/recording process
+        # until the user explicitly opens the library.
+        if self.library_window is None:
+            from .library_window import LibraryWindow
+            self.library_window = LibraryWindow(
+                self.root / "sessions",
+                Path(self.obs_folder) if self.obs_folder else
+                (Path(self.last_recording).parent if self.last_recording else None),
+                self,
+            )
+            self.library_window.destroyed.connect(self.library_closed)
+        self.library_window.showNormal()
+        self.library_window.raise_()
+        self.library_window.activateWindow()
+
+    def library_closed(self, *_args):
+        self.library_window = None
+
     def open_recordings(self):
         # While recording, OBS knows the output folder; use latest one otherwise.
         p = (Path(self.last_recording).parent if self.last_recording else
@@ -378,6 +406,14 @@ class MainWindow(QMainWindow):
                 return
         if self.hotkeys:
             self.hotkeys.stop()
+        if self.library_window is not None:
+            from PySide6.QtCore import QProcess
+            if self.library_window.export_process.state() != QProcess.ProcessState.NotRunning:
+                self.library_window.showNormal()
+                self.library_window.raise_()
+                QMessageBox.information(self, "dogears", "Finish or cancel the clip export before quitting.")
+                return
+            self.library_window.close()
         self.tray.hide()
         self.pool.shutdown(wait=False, cancel_futures=True)
         QApplication.instance().quit()
