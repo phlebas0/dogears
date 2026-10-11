@@ -1,0 +1,31 @@
+# Python and local environments
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.egg-info/
+
+# Build output
+build/
+dist/
+*.spec
+
+# Local settings, secrets, recordings
+.env
+.env.*
+settings.json
+config.local.json
+*.mkv
+*.mp4
+*.mov
+*.avi
+*.webm
+*.bookmarks.json
+sessions/
+tools/ffmpeg.exe
+
+# Editor and OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
