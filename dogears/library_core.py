@@ -168,3 +168,74 @@ def suggested_clip_name(video: Path, start: float, end: float) -> str:
     def slug(n: float) -> str:
         return timecode(n).split(".")[0].replace(":", "-")
     return f"{video.stem}_clip_{slug(start)}_{slug(end)}.mp4"
+
+
+# A separate project file keeps manual clip decisions out of recording metadata.
+# Saved ranges belong to one recording; no video file is modified.
+def clip_project_path(sessions_folder: Path, session_id: str) -> Path:
+    import hashlib
+    digest = hashlib.sha256(session_id.encode('utf-8')).hexdigest()
+    return sessions_folder / 'clip_projects' / f'{digest}.json'
+
+
+def load_clip_ranges(sessions_folder: Path, session_id: str) -> list[tuple[float, float]]:
+    path = clip_project_path(sessions_folder, session_id)
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if data.get('session_id') != session_id:
+            return []
+        ranges = []
+        for pair in data.get('clips', []):
+            if not isinstance(pair, list) or len(pair) != 2:
+                continue
+            try:
+                start, end = float(pair[0]), float(pair[1])
+                if math.isfinite(start) and math.isfinite(end) and start >= 0 and end - start >= 0.1:
+                    ranges.append((start, end))
+            except (ValueError, TypeError):
+                pass
+        return ranges[:500]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def save_clip_ranges(sessions_folder: Path, session_id: str, ranges: list[tuple[float, float]]) -> None:
+    if len(ranges) > 500:
+        raise ValueError('Too many clips in one session (limit 500).')
+    for start, end in ranges:
+        # Validate order, finite values and minimum length, independently of video duration.
+        validate_range(start, end, end)
+    atomic_json(clip_project_path(sessions_folder, session_id), {
+        'schema_version': 1, 'session_id': session_id,
+        'clips': [[start, end] for start, end in ranges],
+    })
+
+
+def separate_clip_destinations(video: Path, directory: Path, clips: list[tuple[float, float]]) -> list[Path]:
+    """Stable, numbered names in the user-selected clip order."""
+    if not clips:
+        raise ValueError('Add at least one clip before exporting.')
+    for start, end in clips:
+        validate_range(start, end, end)
+    return [directory / f'{video.stem}_clip_{index:03d}_'
+            f'{timecode(start)[:8].replace(":", "-")}_'
+            f'{timecode(end)[:8].replace(":", "-")}.mp4'
+            for index, (start, end) in enumerate(clips, 1)]
+
+
+def concat_manifest(segments: list[Path]) -> str:
+    """Safe relative paths for FFmpeg concat demuxer (homogeneous segments)."""
+    if not segments:
+        raise ValueError('No segments to concatenate.')
+    if any(not name.name.startswith('segment_') or name.suffix != '.mp4' for name in segments):
+        raise ValueError('Unexpected intermediate segment filename.')
+    return ''.join(f"file '{name.name}'\n" for name in segments)
+
+
+def concat_arguments(manifest: Path, destination: Path) -> list[str]:
+    return [
+        '-nostdin', '-hide_banner', '-loglevel', 'error', '-progress', 'pipe:1',
+        '-f', 'concat', '-safe', '1', '-i', str(manifest),
+        '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', '-movflags', '+faststart',
+        '-n', str(destination),
+    ]

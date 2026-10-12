@@ -1,16 +1,28 @@
-# dogears v0.2.0 — manual gameplay bookmarks and clip library
+# dogears v0.3.0 — draggable clip ranges and batch exports
 
 A lightweight Windows system-tray controller for OBS. **F9** starts/stops a full recording; **F8** bookmarks a moment. The recording library opens only when requested and lets you manually review and export clips. No automatic clipping, replay buffer, gameplay scanning, or accounts.
 
-## What's new in v0.2.0
+## What's new in v0.3.0
 
-- Recording library listing existing dogears sessions (date, approximate duration, bookmark count, file size).
-- Embedded video player for recorded MKV/MP4 files, with seekable timeline and green bookmark ticks.
-- Click a bookmark to jump to five seconds before the moment.
-- **Set In** and **Set Out** at the playback cursor, or enter timecodes in `HH:MM:SS.mmm` format.
-- **Export selected clip** to a new MP4, only when you click the export button. Existing video is never modified or overwritten. Exports include the video and all available audio tracks.
-- Missing-file relinking for moved recordings; existing v0.1 bookmark JSON works as-is.
-- Library loads on demand; no video decoder or FFmpeg process runs during gameplay.
+- **Draggable blue In and Out handles** on the recording timeline. Click/drag elsewhere on the timeline to seek; green bookmark markers still show the moments saved during gameplay.
+- While the **recording library** window is active, press **I** to set the clip start at the current playhead position and **O** to set the end. The Set In / Set Out buttons and typed timecodes also remain available. These are **window-local shortcuts**, not global recording hotkeys (F9 and F8 remain unchanged).
+- **Multiple clip selections per recording**: set In/Out → **Add clip** → **New selection** → repeat. Click a saved clip to edit it by dragging the handles or using I/O; edits are saved immediately after releasing a handle. Remove or move clips up/down to control export order.
+- Selections survive closing the library and restarting dogears. They're kept in `%APPDATA%\dogears\sessions\clip_projects`, separately from recording bookmarks.
+- **Export clips…** offers two modes:
+  - **Separate MP4 files**: choose a folder; create numbered files for all saved selections.
+  - **Merge into one MP4**: choose a final path; dogears encodes the selections into a temporary directory and joins them **in list order** into one video, then cleans up the temporary clips.
+- Exports are manual only. The original recording is never modified or overwritten. The library and FFmpeg are not needed while recording gameplay.
+
+### Review and export workflow
+
+1. Open **Recording library** and choose a recording.
+2. Seek to the start of an interesting moment. Press **I**, or drag the left blue handle.
+3. Seek to its end and press **O**, or drag the right handle. The two timecode boxes show precise In/Out positions.
+4. Click **Add clip**. For additional clips, click **New selection**, choose a new range, then **Add clip** again.
+5. Click clips in the list to review or adjust them. Move clips up or down if necessary.
+6. Choose **Separate MP4 files** or **Merge into one MP4**, then click **Export clips…**. Exports run sequentially with progress and cancellation support.
+
+**Scope:** Clips in one export are from the **currently selected recording**. Cross-recording montage projects are not yet supported. To export a range you must first add it to the clip list. Saved clips are held in local metadata, not pre-rendered video files.
 
 ## Requirements
 
@@ -24,11 +36,11 @@ Qt Multimedia powers playback; codec support can depend on the media and Windows
 ## Installing or upgrading
 
 1. **Quit dogears from its system-tray menu.** Keep a copy of your working v0.1 project or commit first.
-2. Copy the v0.2.0 source files into your existing dogears project folder (the one containing `main.py`). Don't delete its `.git` folder. Existing settings and recordings are stored separately in `%APPDATA%\dogears` and in your OBS video folder.
+2. Copy the v0.3.0 source files into your existing dogears project folder (the one containing `main.py`). Don't delete its `.git` folder. Existing settings and recordings are stored separately in `%APPDATA%\dogears` and in your OBS video folder.
 3. Double-click `setup_windows.bat` (reuses your local `.venv` or creates it). It installs/updates the dependencies.
 4. Start OBS, then double-click `run_windows.bat`. Use `run_debug_windows.bat` if an error needs diagnosing.
 5. In dogears, click **Recording library**. Right-clicking the tray icon also provides this menu item.
-6. Select a session, play it, click bookmarks, set the In/Out points and click **Export selected clip…**.
+6. Select a session, play it, click bookmarks, choose ranges with I/O or the handles, **Add clip**, and use **Export clips…**.
 
 The status beside each session indicates if its video is missing. Click **Locate missing video** if you've moved the file. The library shows sessions recorded with dogears, or standalone `*.bookmarks.json` sidecars found directly inside the current OBS output directory. It does *not* ingest unrelated OBS recordings lacking a dogears session.
 
@@ -38,18 +50,19 @@ OBS continues to handle capture, encoding, output quality, folder and audio trac
 
 Recording hotkeys default to **F9** (toggle) and **F8** (bookmark). You can customise these and adjust or mute the start/bookmark/stop sounds under dogears **Settings**. Closing the main window leaves the tray and hotkeys running; right-click the tray icon and choose **Quit** to fully exit.
 
-If you record with multiple OBS audio tracks, the manual FFmpeg export maps all audio tracks into the exported MP4. Export is a re-encode using H.264 / AAC for accurate cuts, so exporting a clip takes time and uses CPU. The app shows export progress and allows cancellation. No exporting happens during gameplay unless you explicitly trigger it.
+If you record with multiple OBS audio tracks, the manual FFmpeg export maps all available audio tracks into the exported MP4. Each clip is re-encoded to H.264 / AAC for accurate cuts, so exporting takes CPU time. Merge mode joins these consistently encoded pieces using FFmpeg without re-encoding the concatenation. The app shows sequential export progress and allows cancellation. Cancelled/failed separate exports may leave already completed files; merge mode cleans up its own temporary segments. No exporting happens during gameplay.
 
 ## Storage and privacy
 
 - Original footage: OBS configured output directory.
 - Session JSON (saved immediately at each bookmark): `%APPDATA%\dogears\sessions\<session-id>.json`.
+- Clip project JSON (saved on edits): `%APPDATA%\dogears\sessions\clip_projects\<hashed-session-id>.json`.
 - Sidecar (written after normal stop): `<video-name>.bookmarks.json`, alongside the original recording.
 - Settings: `%APPDATA%\dogears\settings.json`.
 - OBS WebSocket password: Windows Credential Manager (`keyring`), not included in settings JSON.
 - Exports: wherever you choose in the save dialogue. Existing files are never overwritten.
 
-Version 0.1 sessions and settings are preserved. No migration or database is necessary.
+Existing v0.1 and v0.2 sessions and settings are preserved. No migration or database is necessary.
 
 ## Development
 
@@ -65,7 +78,7 @@ Pure recording and library helpers are isolated in `dogears/core.py` and `dogear
 
 ## Known limitations and safeguards
 
-- **Windows GUI not yet physically tested:** the automated tests validate backend, sidecar indexing, ranges and export arguments; you should test the actual PySide6 player/OBS integration on Windows with a short recording before relying on it. The supplied release is a development prototype, not a polished production build.
+- **Windows GUI not yet physically tested for v0.3:** automated tests cover clip persistence, ordering, export arguments, and an actual FFmpeg merge, but the draggable Qt controls still need testing on your Windows machine. The supplied release is a development prototype, not a polished production build.
 - Current implementation only tracks recording sessions it started. If OBS is stopped manually outside dogears, the JSON remains but the final video may need manual relinking.
 - The list shows session duration estimated from start/stop timestamps, which can differ from the recorded media duration; the selected player's timeline uses its actual duration.
 - Preview functionality requires codecs supported by Qt Multimedia in your environment.
