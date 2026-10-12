@@ -1,11 +1,19 @@
-# dogears v0.3.0 — draggable clip ranges and batch exports
+# dogears v0.4.0 — bookmark previews and zoomable timeline
 
 A lightweight Windows system-tray controller for OBS. **F9** starts/stops a full recording; **F8** bookmarks a moment. The recording library opens only when requested and lets you manually review and export clips. No automatic clipping, replay buffer, gameplay scanning, or accounts.
 
-## What's new in v0.3.0
+## What's new in v0.4.0
+
+- **Restored bookmark markers:** the old native slider has been replaced with a custom-drawn timeline. Bookmark timestamps appear as prominent green flags in a separate lane above the blue clip selection. Click a flag to jump to the corresponding bookmark (with five seconds of preroll).
+- **Bookmark thumbnails:** each row in the bookmark list contains a 160×90 preview frame from that part of the recorded video, alongside the timestamp. Frames are generated sequentially *only when opening a recording library*, with FFmpeg, and cached under `%LOCALAPPDATA%\dogears\thumbnails`. They are never generated while gaming; existing recordings work without migration. If FFmpeg is not installed or a particular frame cannot be decoded, the timecoded bookmark remains available with a placeholder.
+- **Zoom and pan:** slider and +/- buttons give **1× to 32×** timeline zoom. Use the horizontal scrollbar below the timeline to view another section without changing the playback position. Blue handles, playhead and green bookmarks all stay aligned during zoom.
+- **Button labels simplified:** both start and end controls are labelled **Set** beside their respective time fields. Keyboard shortcuts **I** / **O** still set In / Out at the current playhead position.
+- The editor pane scrolls vertically when the window is small so clipping/export controls remain accessible.
+
+## Features introduced in v0.3.0
 
 - **Draggable blue In and Out handles** on the recording timeline. Click/drag elsewhere on the timeline to seek; green bookmark markers still show the moments saved during gameplay.
-- While the **recording library** window is active, press **I** to set the clip start at the current playhead position and **O** to set the end. The Set In / Set Out buttons and typed timecodes also remain available. These are **window-local shortcuts**, not global recording hotkeys (F9 and F8 remain unchanged).
+- While the **recording library** window is active, press **I** to set the clip start at the current playhead position and **O** to set the end. The two **Set** buttons (beside Clip start and Clip end) and typed timecodes also remain available. These are **window-local shortcuts**, not global recording hotkeys (F9 and F8 remain unchanged).
 - **Multiple clip selections per recording**: set In/Out → **Add clip** → **New selection** → repeat. Click a saved clip to edit it by dragging the handles or using I/O; edits are saved immediately after releasing a handle. Remove or move clips up/down to control export order.
 - Selections survive closing the library and restarting dogears. They're kept in `%APPDATA%\dogears\sessions\clip_projects`, separately from recording bookmarks.
 - **Export clips…** offers two modes:
@@ -36,7 +44,7 @@ Qt Multimedia powers playback; codec support can depend on the media and Windows
 ## Installing or upgrading
 
 1. **Quit dogears from its system-tray menu.** Keep a copy of your working v0.1 project or commit first.
-2. Copy the v0.3.0 source files into your existing dogears project folder (the one containing `main.py`). Don't delete its `.git` folder. Existing settings and recordings are stored separately in `%APPDATA%\dogears` and in your OBS video folder.
+2. Copy the v0.4.0 source files into your existing dogears project folder (the one containing `main.py`). Don't delete its `.git` folder. Existing settings and recordings are stored separately in `%APPDATA%\dogears` and in your OBS video folder.
 3. Double-click `setup_windows.bat` (reuses your local `.venv` or creates it). It installs/updates the dependencies.
 4. Start OBS, then double-click `run_windows.bat`. Use `run_debug_windows.bat` if an error needs diagnosing.
 5. In dogears, click **Recording library**. Right-clicking the tray icon also provides this menu item.
@@ -78,7 +86,7 @@ Pure recording and library helpers are isolated in `dogears/core.py` and `dogear
 
 ## Known limitations and safeguards
 
-- **Windows GUI not yet physically tested for v0.3:** automated tests cover clip persistence, ordering, export arguments, and an actual FFmpeg merge, but the draggable Qt controls still need testing on your Windows machine. The supplied release is a development prototype, not a polished production build.
+- **Windows GUI not yet physically tested for v0.4:** automated tests cover clip persistence, export arguments, zoom calculations, thumbnail extraction and an actual FFmpeg merge, but the Qt timeline, image list and scrollbar still need testing on your Windows machine. The supplied release is a development prototype, not a polished production build.
 - Current implementation only tracks recording sessions it started. If OBS is stopped manually outside dogears, the JSON remains but the final video may need manual relinking.
 - The list shows session duration estimated from start/stop timestamps, which can differ from the recorded media duration; the selected player's timeline uses its actual duration.
 - Preview functionality requires codecs supported by Qt Multimedia in your environment.

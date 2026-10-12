@@ -6,21 +6,25 @@ or FFmpeg-export functionality is running during gameplay.
 from __future__ import annotations
 
 from datetime import datetime
+import os
 import tempfile
+from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QShortcut, QKeySequence
+from PySide6.QtCore import QProcess, QTimer, Qt, QUrl, Signal, QSize, QPointF
+from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QShortcut, QKeySequence, QPixmap, QIcon
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QAbstractItemView, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
     QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton, QComboBox,
-    QSlider, QSplitter, QStyle, QStyleOptionSlider, QTableWidget, QTableWidgetItem,
+    QSlider, QScrollBar, QSplitter, QScrollArea, QFrame, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from .core import timecode
+from .timeline_math import viewport_span, clamp_view_start, ms_to_fraction, fraction_to_ms
+from .thumbnail_core import thumbnail_name, thumbnail_args
 from .library_core import (
     Recording, export_arguments, find_ffmpeg, load_recordings, parse_timecode,
     relink_video, validate_range, load_clip_ranges, save_clip_ranges,
@@ -46,24 +50,78 @@ def readable_size(size: int | None) -> str:
     return "—"
 
 
-class BookmarkTimeline(QSlider):
-    """Seek bar with bookmark ticks and two independently draggable clip handles."""
+class BookmarkTimeline(QWidget):
+    """Painted timeline with dedicated bookmark lane, clip grips, playhead and zoom.
+
+    The original QSlider drew bookmark ticks over native controls; its handle and
+    style could cover the markers. A single custom painting coordinate system
+    keeps ticks, selection grips and seeking aligned even when zoomed.
+    """
 
     seek_requested = Signal(int)
+    bookmark_clicked = Signal(int)
     range_dragged = Signal(float, float)
     range_drag_finished = Signal()
+    viewport_changed = Signal()
 
     def __init__(self, parent=None):
-        super().__init__(Qt.Orientation.Horizontal, parent)
+        super().__init__(parent)
         self.bookmarks: tuple[float, ...] = ()
         self.clip_start: float | None = None
         self.clip_end: float | None = None
+        self.duration_ms = 0
+        self.position_ms = 0
+        self.zoom_factor = 1.0
+        self.view_start_ms = 0
         self._drag_handle: str | None = None
         self._seek_dragging = False
-        self.setRange(0, 0)
-        self.setMinimumHeight(48)
+        self.setMinimumHeight(102)
         self.setMouseTracking(True)
-        self.setToolTip('Drag blue In/Out handles; click elsewhere to seek. Green ticks are bookmarks.')
+        self.setToolTip('Green flags are bookmarks. Drag blue handles to adjust a clip; scroll below to pan.')
+
+    def setRange(self, minimum: int, maximum: int):
+        self.setMaximum(maximum)
+
+    def setMaximum(self, duration_ms: int):
+        self.duration_ms = max(0, duration_ms)
+        self.position_ms = min(self.position_ms, self.duration_ms)
+        self.view_start_ms = clamp_view_start(self.duration_ms, self.zoom_factor, self.view_start_ms)
+        self.viewport_changed.emit()
+        self.update()
+
+    def setValue(self, value_ms: int):
+        self.position_ms = max(0, min(self.duration_ms, value_ms))
+        self.update()
+
+    def isSliderDown(self) -> bool:
+        return self._seek_dragging or self._drag_handle is not None
+
+    def visible_span_ms(self) -> int:
+        return viewport_span(self.duration_ms, self.zoom_factor)
+
+    def max_view_start_ms(self) -> int:
+        return max(0, self.duration_ms - self.visible_span_ms())
+
+    def set_zoom(self, zoom: float, focus_ms: int | None = None):
+        if focus_ms is None:
+            focus_ms = self.position_ms
+        old_span = self.visible_span_ms()
+        focus_fraction = ms_to_fraction(focus_ms, self.view_start_ms, old_span)
+        self.zoom_factor = max(1.0, min(32.0, zoom))
+        target = focus_ms - focus_fraction * self.visible_span_ms()
+        self.set_view_start(target)
+
+    def set_view_start(self, start_ms: float):
+        requested = clamp_view_start(self.duration_ms, self.zoom_factor, start_ms)
+        if requested != self.view_start_ms:
+            self.view_start_ms = requested
+        self.viewport_changed.emit()
+        self.update()
+
+    def reveal(self, position_ms: int):
+        span = self.visible_span_ms()
+        if position_ms < self.view_start_ms or position_ms > self.view_start_ms + span:
+            self.set_view_start(position_ms - span * 0.20)
 
     def set_marks(self, marks: tuple[float, ...]):
         self.bookmarks = marks
@@ -74,119 +132,136 @@ class BookmarkTimeline(QSlider):
         self.update()
 
     def _track(self) -> tuple[float, float, float]:
-        option = QStyleOptionSlider()
-        self.initStyleOption(option)
-        groove = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider, option,
-            QStyle.SubControl.SC_SliderGroove, self,
-        )
-        handle = self.style().subControlRect(
-            QStyle.ComplexControl.CC_Slider, option,
-            QStyle.SubControl.SC_SliderHandle, self,
-        )
-        half = handle.width() / 2
-        left = groove.left() + half
-        right = max(left + 1, groove.right() - half)
-        return left, right, groove.center().y()
+        return 18.0, float(max(19, self.width() - 18)), 52.0
 
-    def _x(self, seconds: float, left: float, right: float) -> float:
-        duration = self.maximum() / 1000
-        return left + (right - left) * min(1.0, max(0.0, seconds / duration)) if duration else left
+    def _x(self, seconds: float) -> float:
+        left, right, _ = self._track()
+        frac = ms_to_fraction(seconds * 1000, self.view_start_ms, self.visible_span_ms())
+        return left + frac * (right - left)
 
     def _seconds_at(self, x: float) -> float:
         left, right, _ = self._track()
-        fraction = max(0.0, min(1.0, (x - left) / (right - left)))
-        return round(fraction * self.maximum()) / 1000
+        return fraction_to_ms((x - left) / (right - left), self.view_start_ms, self.visible_span_ms()) / 1000
 
     def _handle_at(self, x: float, y: float) -> str | None:
-        if self.maximum() <= 0 or self.clip_start is None or self.clip_end is None:
+        if self.duration_ms <= 0 or self.clip_start is None or self.clip_end is None:
             return None
-        left, right, mid = self._track()
-        # Reserve a taller hit target than the drawn handle, including at 0/duration.
-        if abs(y - mid) > 22:
+        if not 35 <= y <= 72:
             return None
-        start_dist = abs(x - self._x(self.clip_start, left, right))
-        end_dist = abs(x - self._x(self.clip_end, left, right))
-        closest = min(start_dist, end_dist)
-        if closest > 11:
+        a, b = self._x(self.clip_start), self._x(self.clip_end)
+        distance = min(abs(x - a), abs(x - b))
+        if distance > 11:
             return None
-        return 'in' if start_dist <= end_dist else 'out'
+        return 'in' if abs(x - a) <= abs(x - b) else 'out'
+
+    def _bookmark_at(self, x: float, y: float) -> int | None:
+        if not 5 <= y <= 34:
+            return None
+        visible = [(abs(x - self._x(t)), idx) for idx, t in enumerate(self.bookmarks)
+                   if 0 <= ms_to_fraction(t * 1000, self.view_start_ms, self.visible_span_ms()) <= 1]
+        if not visible:
+            return None
+        distance, index = min(visible)
+        return index if distance <= 9 else None
 
     def paintEvent(self, event):
-        super().paintEvent(event)
-        if self.maximum() <= 0:
-            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         left, right, mid = self._track()
-        if self.clip_start is not None and self.clip_end is not None:
-            a = self._x(self.clip_start, left, right)
-            b = self._x(self.clip_end, left, right)
-            # Wide blue range with grip handles distinguishable from the seek thumb.
-            painter.setPen(QPen(QColor(54, 134, 211, 190), 6))
-            painter.drawLine(round(a), round(mid + 10), round(b), round(mid + 10))
-            for x in (a, b):
-                painter.setPen(QPen(QColor('#195e9b'), 1))
-                painter.setBrush(QBrush(QColor('#66bbf1')))
-                painter.drawRoundedRect(round(x) - 5, round(mid) - 16, 10, 32, 3, 3)
-        painter.setPen(QPen(QColor('#20a477'), 2.5))
-        for seconds in self.bookmarks:
-            x = round(self._x(seconds, left, right))
-            painter.drawLine(x, round(mid - 20), x, round(mid - 9))
+        painter.setPen(QPen(QColor('#63738a'), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(left, mid), QPointF(right, mid))
+        if self.duration_ms > 0:
+            # Draw selection first, then bookmark lane so no handles obscure green flags.
+            if self.clip_start is not None and self.clip_end is not None:
+                a, b = self._x(self.clip_start), self._x(self.clip_end)
+                a, b = max(left, a), min(right, b)
+                if a <= b:
+                    painter.setPen(QPen(QColor('#55b6f3'), 8))
+                    painter.drawLine(QPointF(a, mid), QPointF(b, mid))
+                for x in (self._x(self.clip_start), self._x(self.clip_end)):
+                    if left <= x <= right:
+                        painter.setPen(QPen(QColor('#b9dfff'), 1.5))
+                        painter.setBrush(QBrush(QColor('#1677c5')))
+                        painter.drawRoundedRect(round(x) - 6, 37, 12, 31, 3, 3)
+            for idx, seconds in enumerate(self.bookmarks):
+                x = self._x(seconds)
+                if not left <= x <= right:
+                    continue
+                # Green marker occupies its own row, above the draggable selection.
+                painter.setPen(QPen(QColor('#21d19a'), 2.5))
+                painter.drawLine(QPointF(x, 22), QPointF(x, 37))
+                painter.setBrush(QBrush(QColor('#21d19a')))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(x, 17), 5, 5)
+            play_x = self._x(self.position_ms / 1000)
+            if left <= play_x <= right:
+                painter.setPen(QPen(QColor('#f0f4ff'), 2))
+                painter.drawLine(QPointF(play_x, 36), QPointF(play_x, 73))
+                painter.setBrush(QBrush(QColor('#f0f4ff')))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(play_x, 35), 4, 4)
+        painter.setPen(QColor('#8995a7'))
+        view_end_ms = min(self.duration_ms, self.view_start_ms + self.visible_span_ms())
+        painter.drawText(18, 93, timecode(self.view_start_ms / 1000))
+        right_label = timecode(view_end_ms / 1000)
+        painter.drawText(max(18, self.width() - 18 - painter.fontMetrics().horizontalAdvance(right_label)), 93, right_label)
         painter.end()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.maximum() > 0:
-            handle = self._handle_at(event.position().x(), event.position().y())
+        if event.button() == Qt.MouseButton.LeftButton and self.duration_ms > 0:
+            x, y = event.position().x(), event.position().y()
+            bookmark = self._bookmark_at(x, y)
+            if bookmark is not None:
+                self.bookmark_clicked.emit(bookmark)
+                event.accept()
+                return
+            handle = self._handle_at(x, y)
             if handle:
                 self._drag_handle = handle
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 event.accept()
                 return
-            value = round(self._seconds_at(event.position().x()) * 1000)
             self._seek_dragging = True
-            self.setSliderDown(True)
-            self.setValue(value)
-            self.seek_requested.emit(value)
+            self.setValue(round(self._seconds_at(x) * 1000))
+            self.seek_requested.emit(self.position_ms)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._drag_handle is not None:
-            position = self._seconds_at(event.position().x())
+        x, y = event.position().x(), event.position().y()
+        if self._drag_handle:
+            position = self._seconds_at(x)
             start, end = self.clip_start, self.clip_end
-            minimum = 0.1
-            duration = self.maximum() / 1000
+            duration = self.duration_ms / 1000
             if self._drag_handle == 'in':
-                start = min(max(0, position), end - minimum)
+                start = min(max(0, position), end - 0.1)
             else:
-                end = max(min(duration, position), start + minimum)
+                end = max(min(duration, position), start + 0.1)
             self.set_clip_range(start, end)
             self.range_dragged.emit(start, end)
             event.accept()
             return
         if self._seek_dragging:
-            value = round(self._seconds_at(event.position().x()) * 1000)
-            self.setValue(value)
-            self.seek_requested.emit(value)
+            self.setValue(round(self._seconds_at(x) * 1000))
+            self.seek_requested.emit(self.position_ms)
             event.accept()
             return
-        over = self._handle_at(event.position().x(), event.position().y())
-        self.setCursor(Qt.CursorShape.SizeHorCursor if over else Qt.CursorShape.ArrowCursor)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if self._bookmark_at(x, y) is not None
+                       else Qt.CursorShape.SizeHorCursor if self._handle_at(x, y) else Qt.CursorShape.ArrowCursor)
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        if self._drag_handle is not None and event.button() == Qt.MouseButton.LeftButton:
-            self._drag_handle = None
-            self.range_drag_finished.emit()
-            event.accept()
-            return
-        if self._seek_dragging and event.button() == Qt.MouseButton.LeftButton:
-            self._seek_dragging = False
-            self.setSliderDown(False)
-            event.accept()
-            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._drag_handle:
+                self._drag_handle = None
+                self.range_drag_finished.emit()
+                event.accept()
+                return
+            if self._seek_dragging:
+                self._seek_dragging = False
+                event.accept()
+                return
         super().mouseReleaseEvent(event)
 
 
@@ -217,6 +292,13 @@ class LibraryWindow(QMainWindow):
         self.export_mode = 'separate'
         self.export_temp: tempfile.TemporaryDirectory | None = None
         self.export_summary = ''
+        self._thumbnail_epoch = 0
+        self._thumbnail_queue = deque()
+        self._thumbnail_process: QProcess | None = None
+        self._thumbnail_ffmpeg: str | None = None
+        self._follow_playhead = True
+        cache_root = Path(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir())
+        self.thumbnail_dir = cache_root / 'dogears' / 'thumbnails'
 
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
@@ -282,7 +364,7 @@ class LibraryWindow(QMainWindow):
         self.filename.setWordWrap(True)
         lyt_right.addWidget(self.filename)
         self.video = QVideoWidget()
-        self.video.setMinimumHeight(240)
+        self.video.setMinimumHeight(200)
         self.player.setVideoOutput(self.video)
         lyt_right.addWidget(self.video, 3)
         playback = QHBoxLayout()
@@ -303,16 +385,45 @@ class LibraryWindow(QMainWindow):
         lyt_right.addLayout(playback)
         self.timeline = BookmarkTimeline()
         self.timeline.seek_requested.connect(self.player.setPosition)
-        self.timeline.sliderMoved.connect(self.player.setPosition)
+        self.timeline.bookmark_clicked.connect(self.select_timeline_bookmark)
         self.timeline.range_dragged.connect(self.range_dragged)
         self.timeline.range_drag_finished.connect(self.range_edited)
+        self.timeline.viewport_changed.connect(self.sync_timeline_scroll)
         lyt_right.addWidget(self.timeline)
-        guide = QLabel('Drag the blue In/Out handles on the timeline · I = In · O = Out (playhead)')
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel('Timeline zoom'))
+        self.zoom_out = QPushButton('−')
+        self.zoom_out.setFixedWidth(30)
+        self.zoom_out.clicked.connect(lambda: self.zoom_slider.setValue(max(1, self.zoom_slider.value() - 1)))
+        zoom_row.addWidget(self.zoom_out)
+        self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
+        self.zoom_slider.setRange(1, 32)
+        self.zoom_slider.setValue(1)
+        self.zoom_slider.setToolTip('Zoom around the playback position (1×–32×)')
+        self.zoom_slider.valueChanged.connect(self.change_timeline_zoom)
+        zoom_row.addWidget(self.zoom_slider, 1)
+        self.zoom_in = QPushButton('+')
+        self.zoom_in.setFixedWidth(30)
+        self.zoom_in.clicked.connect(lambda: self.zoom_slider.setValue(min(32, self.zoom_slider.value() + 1)))
+        zoom_row.addWidget(self.zoom_in)
+        self.zoom_label = QLabel('1×')
+        self.zoom_label.setMinimumWidth(36)
+        zoom_row.addWidget(self.zoom_label)
+        lyt_right.addLayout(zoom_row)
+        self.timeline_scroll = QScrollBar(Qt.Orientation.Horizontal)
+        self.timeline_scroll.setToolTip('Pan through the zoomed recording without changing playback position')
+        self.timeline_scroll.valueChanged.connect(self.pan_timeline)
+        self.timeline_scroll.setVisible(False)
+        lyt_right.addWidget(self.timeline_scroll)
+        guide = QLabel('Green dots = bookmarks (click to jump) · drag blue edges to resize · I/O = playhead In/Out')
         guide.setStyleSheet('color: #768092; font-size: 11px')
         lyt_right.addWidget(guide)
         lyt_right.addWidget(QLabel("Bookmarks (click to jump to 5 seconds before a mark)"))
         self.marks = QListWidget()
-        self.marks.setMaximumHeight(105)
+        self.marks.setIconSize(QSize(160, 90))
+        self.marks.setSpacing(3)
+        self.marks.setMinimumHeight(130)
+        self.marks.setMaximumHeight(230)
         self.marks.currentRowChanged.connect(self.jump_bookmark)
         lyt_right.addWidget(self.marks)
 
@@ -321,7 +432,7 @@ class LibraryWindow(QMainWindow):
         self.in_edit = QLineEdit("00:00:00.000")
         self.in_edit.setPlaceholderText("HH:MM:SS.mmm")
         self.in_edit.editingFinished.connect(self.range_edited)
-        self.set_in = QPushButton("Set In")
+        self.set_in = QPushButton("Set")
         self.set_in.clicked.connect(self.mark_in)
         start_row.addWidget(self.in_edit)
         start_row.addWidget(self.set_in)
@@ -330,7 +441,7 @@ class LibraryWindow(QMainWindow):
         self.out_edit = QLineEdit("00:00:00.000")
         self.out_edit.setPlaceholderText("HH:MM:SS.mmm")
         self.out_edit.editingFinished.connect(self.range_edited)
-        self.set_out = QPushButton("Set Out")
+        self.set_out = QPushButton("Set")
         self.set_out.clicked.connect(self.mark_out)
         end_row.addWidget(self.out_edit)
         end_row.addWidget(self.set_out)
@@ -386,7 +497,11 @@ class LibraryWindow(QMainWindow):
         self.shortcut_out = QShortcut(QKeySequence('O'), self)
         self.shortcut_in.activated.connect(self.mark_in)
         self.shortcut_out.activated.connect(self.mark_out)
-        splitter.addWidget(right)
+        right_scroll = QScrollArea()
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        right_scroll.setWidget(right)
+        splitter.addWidget(right_scroll)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 6)
         outer.addWidget(splitter, 1)
@@ -431,6 +546,7 @@ class LibraryWindow(QMainWindow):
         )
 
     def clear_media(self):
+        self.cancel_thumbnails()
         self.player.stop()
         self.player.setSource(QUrl())
         self.selected = None
@@ -443,6 +559,7 @@ class LibraryWindow(QMainWindow):
         self.timeline.setRange(0, 0)
         self.timeline.set_marks(())
         self.timeline.set_clip_range(None, None)
+        self.zoom_slider.setValue(1)
         self.position.setText("00:00:00.000 / 00:00:00.000")
         self.in_edit.setText("00:00:00.000")
         self.out_edit.setText("00:00:00.000")
@@ -464,18 +581,24 @@ class LibraryWindow(QMainWindow):
         self.player.stop()
         self.player.setSource(QUrl())
         self.selected = rec
+        self._follow_playhead = True
         self.user_adjusted_range = False
         self.filename.setText(rec.video.name if rec.video else "Recording file not linked")
         self.filename.setToolTip(str(rec.video or ""))
+        self.cancel_thumbnails()
         self.marks.clear()
         self.clip_ranges = load_clip_ranges(self.sessions_folder, rec.session_id)
         self.current_clip_index = None
         self.refresh_clips()
         for index, seconds in enumerate(rec.bookmarks, 1):
-            self.marks.addItem(f"{index:02d}    {timecode(seconds)}")
+            item = QListWidgetItem(f"{index:02d}    {timecode(seconds)}")
+            item.setSizeHint(QSize(210, 96))
+            item.setIcon(self.thumbnail_placeholder())
+            self.marks.addItem(item)
         self.timeline.setRange(0, 0)
         self.timeline.set_marks(rec.bookmarks)
         self.timeline.set_clip_range(None, None)
+        self.zoom_slider.setValue(1)
         self.position.setText("00:00:00.000 / 00:00:00.000")
         self.in_edit.setText("00:00:00.000")
         self.out_edit.setText("00:00:00.000")
@@ -487,6 +610,7 @@ class LibraryWindow(QMainWindow):
         if rec.available:
             self.detail_status.setText('Use I/O or drag handles to select a range, then Add clip.')
             self.player.setSource(QUrl.fromLocalFile(str(rec.video)))
+            self.queue_thumbnails(rec)
             if self.clip_ranges:
                 self.clips_list.setCurrentRow(0)
             else:
@@ -508,6 +632,8 @@ class LibraryWindow(QMainWindow):
         self.position.setText(f"{timecode(position_ms / 1000)} / {timecode(self.player.duration() / 1000)}")
         if not self.timeline.isSliderDown():
             self.timeline.setValue(position_ms)
+            if self._follow_playhead:
+                self.timeline.reveal(position_ms)
 
     def toggle_playback(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -525,7 +651,118 @@ class LibraryWindow(QMainWindow):
     def jump_bookmark(self, index: int):
         if self.selected and 0 <= index < len(self.selected.bookmarks) and self.selected.available:
             target = max(0, self.selected.bookmarks[index] - 5)
+            self._follow_playhead = True
             self.player.setPosition(round(target * 1000))
+            self.timeline.reveal(round(self.selected.bookmarks[index] * 1000))
+
+    def select_timeline_bookmark(self, index: int):
+        # Selecting the list item triggers the same five-second preroll as clicking the flag.
+        self.marks.setCurrentRow(index)
+        self.jump_bookmark(index)
+
+    def change_timeline_zoom(self, value: int):
+        self._follow_playhead = True
+        self.zoom_label.setText(f'{value}×')
+        self.timeline.set_zoom(value, self.player.position())
+        self.timeline_scroll.setVisible(value > 1 and self.timeline.duration_ms > 0)
+
+    def pan_timeline(self, value: int):
+        self._follow_playhead = False  # Manual panning must not snap back on playback.
+        self.timeline.set_view_start(self.timeline.max_view_start_ms() * value / 10000)
+
+    def sync_timeline_scroll(self):
+        if not hasattr(self, 'timeline_scroll'):
+            return
+        maximum = self.timeline.max_view_start_ms()
+        self.timeline_scroll.blockSignals(True)
+        self.timeline_scroll.setRange(0, 10000 if maximum else 0)
+        self.timeline_scroll.setPageStep(max(1, round(10000 * self.timeline.visible_span_ms() /
+                                                       max(1, self.timeline.duration_ms))))
+        self.timeline_scroll.setValue(round(10000 * self.timeline.view_start_ms / maximum) if maximum else 0)
+        self.timeline_scroll.blockSignals(False)
+        self.timeline_scroll.setVisible(self.timeline.zoom_factor > 1 and self.timeline.duration_ms > 0)
+
+    @staticmethod
+    def thumbnail_placeholder() -> QIcon:
+        image = QPixmap(160, 90)
+        image.fill(QColor('#263445'))
+        painter = QPainter(image)
+        painter.setPen(QColor('#7e91a8'))
+        painter.drawText(image.rect(), Qt.AlignmentFlag.AlignCenter, 'Preview')
+        painter.end()
+        return QIcon(image)
+
+    def cancel_thumbnails(self):
+        self._thumbnail_epoch += 1
+        self._thumbnail_queue.clear()
+        self._thumbnail_ffmpeg = None
+        if self._thumbnail_process is not None:
+            process = self._thumbnail_process
+            self._thumbnail_process = None
+            if process.state() != QProcess.ProcessState.NotRunning:
+                process.kill()
+                process.waitForFinished(500)
+            process.deleteLater()
+
+    def queue_thumbnails(self, recording: Recording):
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg or not recording.video or not recording.bookmarks:
+            if not ffmpeg and recording.bookmarks:
+                self.detail_status.setText('Bookmark thumbnails require FFmpeg; timecodes still work.')
+            return
+        try:
+            self.thumbnail_dir.mkdir(parents=True, exist_ok=True)
+            self._thumbnail_ffmpeg = ffmpeg
+            for index, seconds in enumerate(recording.bookmarks):
+                destination = self.thumbnail_dir / thumbnail_name(recording.video, seconds)
+                if destination.is_file() and destination.stat().st_size > 0:
+                    item = self.marks.item(index)
+                    if item:
+                        item.setIcon(QIcon(str(destination)))
+                else:
+                    self._thumbnail_queue.append((self._thumbnail_epoch, index, recording.video, seconds, destination))
+            self._run_next_thumbnail()
+        except OSError:
+            self.detail_status.setText('Cannot write bookmark thumbnails to the Windows thumbnail cache.')
+
+    def _run_next_thumbnail(self):
+        if self._thumbnail_process is not None or not self._thumbnail_queue:
+            return
+        epoch, index, source, seconds, destination = self._thumbnail_queue.popleft()
+        if epoch != self._thumbnail_epoch:
+            return
+        temporary = destination.with_name(destination.stem + '.partial.jpg')
+        process = QProcess(self)
+        self._thumbnail_process = process
+        process.finished.connect(
+            lambda exit_code, status, proc=process, job=(epoch, index, temporary, destination):
+                self._thumbnail_done(proc, job, exit_code, status))
+        process.errorOccurred.connect(
+            lambda error, proc=process, job=(epoch, index, temporary, destination):
+                self._thumbnail_failed(proc, job, error))
+        process.start(self._thumbnail_ffmpeg, thumbnail_args(source, seconds, temporary))
+
+    def _thumbnail_failed(self, process, job, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self._thumbnail_done(process, job, -1, QProcess.ExitStatus.CrashExit)
+
+    def _thumbnail_done(self, process, job, exit_code, exit_status):
+        if process is not self._thumbnail_process:
+            return
+        self._thumbnail_process = None
+        epoch, index, temporary, destination = job
+        if epoch == self._thumbnail_epoch and exit_code == 0 and temporary.is_file():
+            try:
+                temporary.replace(destination)
+                item = self.marks.item(index)
+                if item is not None:
+                    item.setIcon(QIcon(str(destination)))
+            except OSError:
+                pass
+        else:
+            temporary.unlink(missing_ok=True)
+        process.deleteLater()
+        QTimer.singleShot(0, self._run_next_thumbnail)
 
     def mark_in(self):
         if not self.export_active and self.selected and self.selected.available:
@@ -598,6 +835,8 @@ class LibraryWindow(QMainWindow):
         self.in_edit.setText(timecode(start))
         self.out_edit.setText(timecode(end))
         self.timeline.set_clip_range(start, end)
+        if self.timeline.zoom_factor > 1:
+            self.timeline.set_view_start(start * 1000 - self.timeline.visible_span_ms() * 0.1)
         self.user_adjusted_range = True
         self._showing_selection = False
         self.detail_status.setText(f'Editing clip {index+1}; changes save automatically.')
@@ -885,6 +1124,7 @@ class LibraryWindow(QMainWindow):
                                     'Cancel or finish the export before closing the library.')
             event.ignore()
             return
+        self.cancel_thumbnails()
         self.player.stop()
         self.player.setSource(QUrl())
         self.player.setVideoOutput(None)
