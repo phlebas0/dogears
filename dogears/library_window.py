@@ -12,21 +12,23 @@ from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QTimer, Qt, QUrl, Signal, QSize, QPointF
-from PySide6.QtGui import QBrush, QColor, QPainter, QPen, QShortcut, QKeySequence, QPixmap, QIcon
+from PySide6.QtGui import (QBrush, QColor, QPainter, QPen, QShortcut, QKeySequence,
+                          QPixmap, QIcon, QPolygonF)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QListWidget, QMainWindow, QMessageBox, QPushButton, QComboBox,
+    QAbstractItemView, QFileDialog, QHBoxLayout, QHeaderView,
+    QLabel, QListWidget, QMainWindow, QMessageBox, QPushButton, QComboBox,
     QSlider, QScrollBar, QSplitter, QScrollArea, QFrame, QListWidgetItem, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from .core import timecode
-from .timeline_math import viewport_span, clamp_view_start, ms_to_fraction, fraction_to_ms
-from .thumbnail_core import thumbnail_name, thumbnail_args
+from .timeline_math import (viewport_span, clamp_view_start, ms_to_fraction, fraction_to_ms,
+                            ruler_step_ms, ruler_marks, ruler_label, preview_finished)
+from .thumbnail_core import thumbnail_name, thumbnail_pipe_args, thumbnail_seek_candidates, clip_thumbnail_time
 from .library_core import (
-    Recording, export_arguments, find_ffmpeg, load_recordings, parse_timecode,
+    Recording, export_arguments, find_ffmpeg, load_recordings,
     relink_video, validate_range, load_clip_ranges, save_clip_ranges,
     separate_clip_destinations, concat_manifest, concat_arguments,
 )
@@ -60,6 +62,7 @@ class BookmarkTimeline(QWidget):
 
     seek_requested = Signal(int)
     bookmark_clicked = Signal(int)
+    bookmark_double_clicked = Signal(int)
     range_dragged = Signal(float, float)
     range_drag_finished = Signal()
     viewport_changed = Signal()
@@ -75,9 +78,9 @@ class BookmarkTimeline(QWidget):
         self.view_start_ms = 0
         self._drag_handle: str | None = None
         self._seek_dragging = False
-        self.setMinimumHeight(102)
+        self.setMinimumHeight(130)
         self.setMouseTracking(True)
-        self.setToolTip('Green flags are bookmarks. Drag blue handles to adjust a clip; scroll below to pan.')
+        self.setToolTip('Green bookmark icons jump to marks; white dot is playback. Drag blue handles to adjust clips. The labelled ruler shows recording time.')
 
     def setRange(self, minimum: int, maximum: int):
         self.setMaximum(maximum)
@@ -132,7 +135,7 @@ class BookmarkTimeline(QWidget):
         self.update()
 
     def _track(self) -> tuple[float, float, float]:
-        return 18.0, float(max(19, self.width() - 18)), 52.0
+        return 22.0, float(max(23, self.width() - 22)), 61.0
 
     def _x(self, seconds: float) -> float:
         left, right, _ = self._track()
@@ -146,7 +149,7 @@ class BookmarkTimeline(QWidget):
     def _handle_at(self, x: float, y: float) -> str | None:
         if self.duration_ms <= 0 or self.clip_start is None or self.clip_end is None:
             return None
-        if not 35 <= y <= 72:
+        if not 43 <= y <= 80:
             return None
         a, b = self._x(self.clip_start), self._x(self.clip_end)
         distance = min(abs(x - a), abs(x - b))
@@ -155,7 +158,7 @@ class BookmarkTimeline(QWidget):
         return 'in' if abs(x - a) <= abs(x - b) else 'out'
 
     def _bookmark_at(self, x: float, y: float) -> int | None:
-        if not 5 <= y <= 34:
+        if not 8 <= y <= 43:
             return None
         visible = [(abs(x - self._x(t)), idx) for idx, t in enumerate(self.bookmarks)
                    if 0 <= ms_to_fraction(t * 1000, self.view_start_ms, self.visible_span_ms()) <= 1]
@@ -168,10 +171,9 @@ class BookmarkTimeline(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         left, right, mid = self._track()
-        painter.setPen(QPen(QColor('#63738a'), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.setPen(QPen(QColor('#627388'), 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         painter.drawLine(QPointF(left, mid), QPointF(right, mid))
         if self.duration_ms > 0:
-            # Draw selection first, then bookmark lane so no handles obscure green flags.
             if self.clip_start is not None and self.clip_end is not None:
                 a, b = self._x(self.clip_start), self._x(self.clip_end)
                 a, b = max(left, a), min(right, b)
@@ -182,29 +184,52 @@ class BookmarkTimeline(QWidget):
                     if left <= x <= right:
                         painter.setPen(QPen(QColor('#b9dfff'), 1.5))
                         painter.setBrush(QBrush(QColor('#1677c5')))
-                        painter.drawRoundedRect(round(x) - 6, 37, 12, 31, 3, 3)
-            for idx, seconds in enumerate(self.bookmarks):
+                        painter.drawRoundedRect(round(x) - 5, 45, 10, 32, 3, 3)
+            # Distinct, simple bookmark silhouette with a V-notch, not a pin or flag.
+            for seconds in self.bookmarks:
                 x = self._x(seconds)
                 if not left <= x <= right:
                     continue
-                # Green marker occupies its own row, above the draggable selection.
-                painter.setPen(QPen(QColor('#21d19a'), 2.5))
-                painter.drawLine(QPointF(x, 22), QPointF(x, 37))
-                painter.setBrush(QBrush(QColor('#21d19a')))
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(QPointF(x, 17), 5, 5)
+                painter.setBrush(QBrush(QColor('#21d19a')))
+                painter.drawPolygon(QPolygonF([
+                    QPointF(x - 5, 16), QPointF(x + 5, 16),
+                    QPointF(x + 5, 34), QPointF(x, 29), QPointF(x - 5, 34),
+                ]))
+                painter.setPen(QPen(QColor('#21d19a'), 1.3))
+                painter.drawLine(QPointF(x, 35), QPointF(x, 43))
+            # A single white dot represents the playhead (no tall triangular scrubber).
             play_x = self._x(self.position_ms / 1000)
             if left <= play_x <= right:
-                painter.setPen(QPen(QColor('#f0f4ff'), 2))
-                painter.drawLine(QPointF(play_x, 36), QPointF(play_x, 73))
-                painter.setBrush(QBrush(QColor('#f0f4ff')))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(QPointF(play_x, 35), 4, 4)
-        painter.setPen(QColor('#8995a7'))
-        view_end_ms = min(self.duration_ms, self.view_start_ms + self.visible_span_ms())
-        painter.drawText(18, 93, timecode(self.view_start_ms / 1000))
-        right_label = timecode(view_end_ms / 1000)
-        painter.drawText(max(18, self.width() - 18 - painter.fontMetrics().horizontalAdvance(right_label)), 93, right_label)
+                painter.setPen(QPen(QColor('#213041'), 2))
+                painter.setBrush(QBrush(QColor('#f1f6ff')))
+                painter.drawEllipse(QPointF(play_x, mid), 6, 6)
+
+            # Actual time ruler; ticks remain aligned to absolute times while panning.
+            painter.setFont(self.font())
+            span = self.visible_span_ms()
+            step = ruler_step_ms(span, max(1, round(right - left)))
+            for tick in ruler_marks(self.view_start_ms, span, step):
+                x = left + (tick - self.view_start_ms) / span * (right - left)
+                painter.setPen(QPen(QColor('#8899aa'), 1.2))
+                painter.drawLine(QPointF(x, 90), QPointF(x, 100))
+                label = ruler_label(tick, self.duration_ms, step)
+                text_width = painter.fontMetrics().horizontalAdvance(label)
+                label_x = max(1, min(self.width() - text_width - 1, x - text_width / 2))
+                painter.setPen(QColor('#aebdcd'))
+                painter.drawText(QPointF(label_x, 119), label)
+            # Minor ticks provide scale between the labelled times.
+            sub = step // 5
+            if sub >= 100 and span > 0:
+                for tick in ruler_marks(self.view_start_ms, span, sub):
+                    if tick % step == 0:
+                        continue
+                    x = left + (tick - self.view_start_ms) / span * (right - left)
+                    painter.setPen(QPen(QColor('#65788e'), 1))
+                    painter.drawLine(QPointF(x, 94), QPointF(x, 99))
+        else:
+            painter.setPen(QColor('#8995a7'))
+            painter.drawText(22, 119, '00:00')
         painter.end()
 
     def mousePressEvent(self, event):
@@ -227,6 +252,15 @@ class BookmarkTimeline(QWidget):
             event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            mark = self._bookmark_at(event.position().x(), event.position().y())
+            if mark is not None:
+                self.bookmark_double_clicked.emit(mark)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event):
         x, y = event.position().x(), event.position().y()
@@ -271,14 +305,16 @@ class LibraryWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle("dogears — recording library")
-        self.resize(1250, 850)
-        self.setMinimumSize(990, 690)
+        self.resize(1460, 850)
+        self.setMinimumSize(1100, 690)
         self.sessions_folder = sessions_folder
         self.recording_folder = recording_folder
         self.entries: dict[str, Recording] = {}
         self.selected: Recording | None = None
         self.user_adjusted_range = False
         self.clip_ranges: list[tuple[float, float]] = []
+        self.selection_start: float | None = None
+        self.selection_end: float | None = None
         self.current_clip_index: int | None = None
         self._showing_selection = False
         self.export_error = ""
@@ -297,6 +333,13 @@ class LibraryWindow(QMainWindow):
         self._thumbnail_process: QProcess | None = None
         self._thumbnail_ffmpeg: str | None = None
         self._follow_playhead = True
+        self.preview_active = False
+        self.preview_end_ms = 0
+        self.preview_start_ms = 0
+        self.preview_seeking = False
+        self._thumbnail_errors: list[str] = []
+        self._thumbnail_total = 0
+        self._thumbnail_loaded = 0
         cache_root = Path(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir())
         self.thumbnail_dir = cache_root / 'dogears' / 'thumbnails'
 
@@ -368,10 +411,15 @@ class LibraryWindow(QMainWindow):
         self.player.setVideoOutput(self.video)
         lyt_right.addWidget(self.video, 3)
         playback = QHBoxLayout()
-        self.play = QPushButton("Play")
+        self.play = QPushButton("Play recording")
         self.play.clicked.connect(self.toggle_playback)
         self.play.setEnabled(False)
         playback.addWidget(self.play)
+        self.preview = QPushButton('Play clip')
+        self.preview.setToolTip('Play the selected In–Out range and pause at Out. Double-click a saved clip to play it.')
+        self.preview.clicked.connect(self.toggle_clip_preview)
+        self.preview.setEnabled(False)
+        playback.addWidget(self.preview)
         self.position = QLabel("00:00:00.000 / 00:00:00.000")
         playback.addWidget(self.position)
         playback.addStretch()
@@ -384,77 +432,84 @@ class LibraryWindow(QMainWindow):
         playback.addWidget(self.volume)
         lyt_right.addLayout(playback)
         self.timeline = BookmarkTimeline()
-        self.timeline.seek_requested.connect(self.player.setPosition)
+        self.timeline.seek_requested.connect(self.seek_manually)
         self.timeline.bookmark_clicked.connect(self.select_timeline_bookmark)
+        self.timeline.bookmark_double_clicked.connect(self.play_timeline_bookmark)
         self.timeline.range_dragged.connect(self.range_dragged)
         self.timeline.range_drag_finished.connect(self.range_edited)
         self.timeline.viewport_changed.connect(self.sync_timeline_scroll)
         lyt_right.addWidget(self.timeline)
         zoom_row = QHBoxLayout()
-        zoom_row.addWidget(QLabel('Timeline zoom'))
+        zoom_row.addWidget(QLabel('Timeline scale'))
         self.zoom_out = QPushButton('−')
         self.zoom_out.setFixedWidth(30)
-        self.zoom_out.clicked.connect(lambda: self.zoom_slider.setValue(max(1, self.zoom_slider.value() - 1)))
+        self.zoom_out.clicked.connect(lambda: self.zoom_slider.setValue(max(0, self.zoom_slider.value() - 1)))
         zoom_row.addWidget(self.zoom_out)
         self.zoom_slider = QSlider(Qt.Orientation.Horizontal)
-        self.zoom_slider.setRange(1, 32)
-        self.zoom_slider.setValue(1)
-        self.zoom_slider.setToolTip('Zoom around the playback position (1×–32×)')
+        self.zoom_slider.setRange(0, 5)
+        self.zoom_slider.setValue(0)
+        self.zoom_slider.setToolTip('Fit entire recording, or zoom to 2×, 4×, 8×, 16× or 32×')
         self.zoom_slider.valueChanged.connect(self.change_timeline_zoom)
         zoom_row.addWidget(self.zoom_slider, 1)
         self.zoom_in = QPushButton('+')
         self.zoom_in.setFixedWidth(30)
-        self.zoom_in.clicked.connect(lambda: self.zoom_slider.setValue(min(32, self.zoom_slider.value() + 1)))
+        self.zoom_in.clicked.connect(lambda: self.zoom_slider.setValue(min(5, self.zoom_slider.value() + 1)))
         zoom_row.addWidget(self.zoom_in)
-        self.zoom_label = QLabel('1×')
+        self.zoom_fit = QPushButton('Fit')
+        self.zoom_fit.setToolTip('Show the entire recording')
+        self.zoom_fit.clicked.connect(lambda: self.zoom_slider.setValue(0))
+        zoom_row.addWidget(self.zoom_fit)
+        self.zoom_label = QLabel('Fit')
         self.zoom_label.setMinimumWidth(36)
         zoom_row.addWidget(self.zoom_label)
         lyt_right.addLayout(zoom_row)
+        self.zoom_info = QLabel('Time ruler: entire recording')
+        self.zoom_info.setStyleSheet('color: #8f9eaf; font-size: 11px')
+        lyt_right.addWidget(self.zoom_info)
         self.timeline_scroll = QScrollBar(Qt.Orientation.Horizontal)
         self.timeline_scroll.setToolTip('Pan through the zoomed recording without changing playback position')
         self.timeline_scroll.valueChanged.connect(self.pan_timeline)
         self.timeline_scroll.setVisible(False)
         lyt_right.addWidget(self.timeline_scroll)
-        guide = QLabel('Green dots = bookmarks (click to jump) · drag blue edges to resize · I/O = playhead In/Out')
+        guide = QLabel('Green bookmarks = saved marks · white dot = playhead · drag blue handles to select a clip')
         guide.setStyleSheet('color: #768092; font-size: 11px')
         lyt_right.addWidget(guide)
-        lyt_right.addWidget(QLabel("Bookmarks (click to jump to 5 seconds before a mark)"))
+        lyt_right.addWidget(QLabel("Bookmarks (single-click to seek; double-click to play)"))
         self.marks = QListWidget()
         self.marks.setIconSize(QSize(160, 90))
         self.marks.setSpacing(3)
         self.marks.setMinimumHeight(130)
         self.marks.setMaximumHeight(230)
         self.marks.currentRowChanged.connect(self.jump_bookmark)
+        self.marks.itemDoubleClicked.connect(self.play_bookmark)
         lyt_right.addWidget(self.marks)
+        self.thumbnail_status = QLabel('')
+        self.thumbnail_status.setWordWrap(True)
+        self.thumbnail_status.setStyleSheet('color: #8f9eaf; font-size: 11px')
+        lyt_right.addWidget(self.thumbnail_status)
 
-        editor = QFormLayout()
-        start_row = QHBoxLayout()
-        self.in_edit = QLineEdit("00:00:00.000")
-        self.in_edit.setPlaceholderText("HH:MM:SS.mmm")
-        self.in_edit.editingFinished.connect(self.range_edited)
-        self.set_in = QPushButton("Set")
-        self.set_in.clicked.connect(self.mark_in)
-        start_row.addWidget(self.in_edit)
-        start_row.addWidget(self.set_in)
-        editor.addRow("Clip start", start_row)
-        end_row = QHBoxLayout()
-        self.out_edit = QLineEdit("00:00:00.000")
-        self.out_edit.setPlaceholderText("HH:MM:SS.mmm")
-        self.out_edit.editingFinished.connect(self.range_edited)
-        self.set_out = QPushButton("Set")
-        self.set_out.clicked.connect(self.mark_out)
-        end_row.addWidget(self.out_edit)
-        end_row.addWidget(self.set_out)
-        editor.addRow("Clip end", end_row)
-        lyt_right.addLayout(editor)
-        # Multiple manual clips are kept in a per-session project file.
-        clips_label = QLabel('Clips in export order (select to edit with handles or I/O)')
-        lyt_right.addWidget(clips_label)
+        self.selection_label = QLabel('Selected range: —')
+        self.selection_label.setStyleSheet('font-weight: 600; color: #91cef5')
+        lyt_right.addWidget(self.selection_label)
+        # Clips live in their own right-hand sidebar. The recorder and timeline
+        # remain completely independent of this on-demand layout.
+        clips_sidebar = QWidget()
+        clips_sidebar_layout = QVBoxLayout(clips_sidebar)
+        clips_sidebar_layout.setContentsMargins(8, 3, 3, 4)
+        clips_sidebar_layout.addWidget(QLabel('Clips in export order'))
+        sidebar_help = QLabel('Select to edit · double-click to play · drag blue handles on timeline')
+        sidebar_help.setWordWrap(True)
+        sidebar_help.setStyleSheet('color: #8f9eaf; font-size: 11px')
+        clips_sidebar_layout.addWidget(sidebar_help)
         self.clips_list = QListWidget()
-        self.clips_list.setMaximumHeight(122)
+        self.clips_list.setIconSize(QSize(160, 90))
+        self.clips_list.setSpacing(3)
+        self.clips_list.setMinimumHeight(240)
         self.clips_list.currentRowChanged.connect(self.choose_clip)
-        lyt_right.addWidget(self.clips_list)
-        clip_buttons = QHBoxLayout()
+        self.clips_list.itemDoubleClicked.connect(self.play_saved_clip)
+        clips_sidebar_layout.addWidget(self.clips_list, 1)
+        clip_buttons_top = QHBoxLayout()
+        clip_buttons_bottom = QHBoxLayout()
         self.new_selection_button = QPushButton('New selection')
         self.new_selection_button.clicked.connect(self.new_selection)
         self.add_clip_button = QPushButton('Add clip')
@@ -465,10 +520,12 @@ class LibraryWindow(QMainWindow):
         self.up_button.clicked.connect(lambda: self.move_clip(-1))
         self.down_button = QPushButton('Move down')
         self.down_button.clicked.connect(lambda: self.move_clip(1))
-        for button in (self.new_selection_button, self.add_clip_button,
-                       self.remove_clip_button, self.up_button, self.down_button):
-            clip_buttons.addWidget(button)
-        lyt_right.addLayout(clip_buttons)
+        for button in (self.new_selection_button, self.add_clip_button):
+            clip_buttons_top.addWidget(button)
+        for button in (self.remove_clip_button, self.up_button, self.down_button):
+            clip_buttons_bottom.addWidget(button)
+        clips_sidebar_layout.addLayout(clip_buttons_top)
+        clips_sidebar_layout.addLayout(clip_buttons_bottom)
 
         actions = QHBoxLayout()
         self.locate_button = QPushButton('Locate missing video…')
@@ -487,23 +544,26 @@ class LibraryWindow(QMainWindow):
         self.export = QPushButton('Export clips…')
         self.export.clicked.connect(self.export_clips)
         actions.addWidget(self.export)
-        lyt_right.addLayout(actions)
-        self.detail_status = QLabel('Select an In/Out range, click Add clip, then choose an export format.')
+        clips_sidebar_layout.addLayout(actions)
+        self.detail_status = QLabel('Drag the blue handles to choose a range, click Add clip, then choose an export format.')
         self.detail_status.setWordWrap(True)
         self.detail_status.setStyleSheet('color: #768092')
         lyt_right.addWidget(self.detail_status)
-        # Window-local shortcuts, not global gameplay hotkeys. Text entry still works.
-        self.shortcut_in = QShortcut(QKeySequence('I'), self)
-        self.shortcut_out = QShortcut(QKeySequence('O'), self)
-        self.shortcut_in.activated.connect(self.mark_in)
-        self.shortcut_out.activated.connect(self.mark_out)
         right_scroll = QScrollArea()
         right_scroll.setWidgetResizable(True)
         right_scroll.setFrameShape(QFrame.Shape.NoFrame)
         right_scroll.setWidget(right)
         splitter.addWidget(right_scroll)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 6)
+        clips_sidebar_scroll = QScrollArea()
+        clips_sidebar_scroll.setWidgetResizable(True)
+        clips_sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        clips_sidebar_scroll.setMinimumWidth(280)
+        clips_sidebar_scroll.setWidget(clips_sidebar)
+        splitter.addWidget(clips_sidebar_scroll)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 7)
+        splitter.setStretchFactor(2, 3)
+        splitter.setSizes([315, 815, 330])
         outer.addWidget(splitter, 1)
         self.setCentralWidget(root)
         self.clear_media()
@@ -552,20 +612,21 @@ class LibraryWindow(QMainWindow):
         self.selected = None
         self.filename.setText("Select a recording")
         self.play.setEnabled(False)
+        self.stop_clip_preview()
         self.marks.clear()
+        self.thumbnail_status.clear()
         self.clip_ranges = []
         self.current_clip_index = None
         self.clips_list.clear()
         self.timeline.setRange(0, 0)
         self.timeline.set_marks(())
         self.timeline.set_clip_range(None, None)
-        self.zoom_slider.setValue(1)
+        self.zoom_slider.setValue(0)
         self.position.setText("00:00:00.000 / 00:00:00.000")
-        self.in_edit.setText("00:00:00.000")
-        self.out_edit.setText("00:00:00.000")
+        self.selection_start = None
+        self.selection_end = None
+        self.update_selection_label()
         self.export.setEnabled(False)
-        self.set_in.setEnabled(False)
-        self.set_out.setEnabled(False)
         self.locate_button.setEnabled(False)
         self.update_clip_buttons()
 
@@ -578,6 +639,7 @@ class LibraryWindow(QMainWindow):
         if not rec:
             self.clear_media()
             return
+        self.stop_clip_preview()
         self.player.stop()
         self.player.setSource(QUrl())
         self.selected = rec
@@ -587,6 +649,7 @@ class LibraryWindow(QMainWindow):
         self.filename.setToolTip(str(rec.video or ""))
         self.cancel_thumbnails()
         self.marks.clear()
+        self.thumbnail_status.clear()
         self.clip_ranges = load_clip_ranges(self.sessions_folder, rec.session_id)
         self.current_clip_index = None
         self.refresh_clips()
@@ -598,17 +661,16 @@ class LibraryWindow(QMainWindow):
         self.timeline.setRange(0, 0)
         self.timeline.set_marks(rec.bookmarks)
         self.timeline.set_clip_range(None, None)
-        self.zoom_slider.setValue(1)
+        self.zoom_slider.setValue(0)
         self.position.setText("00:00:00.000 / 00:00:00.000")
-        self.in_edit.setText("00:00:00.000")
-        self.out_edit.setText("00:00:00.000")
+        self.selection_start = None
+        self.selection_end = None
+        self.update_selection_label()
         self.export.setEnabled(bool(rec.available and self.clip_ranges))
         self.play.setEnabled(rec.available)
-        self.set_in.setEnabled(rec.available)
-        self.set_out.setEnabled(rec.available)
         self.locate_button.setEnabled(not rec.available)
         if rec.available:
-            self.detail_status.setText('Use I/O or drag handles to select a range, then Add clip.')
+            self.detail_status.setText('Drag the blue handles to select a range, then Add clip.')
             self.player.setSource(QUrl.fromLocalFile(str(rec.video)))
             self.queue_thumbnails(rec)
             if self.clip_ranges:
@@ -622,27 +684,96 @@ class LibraryWindow(QMainWindow):
     def duration_changed(self, duration_ms: int):
         self.timeline.setMaximum(max(0, duration_ms))
         self.position_changed(self.player.position())
-        if self.selected and duration_ms > 0 and not self.user_adjusted_range:
-            self.in_edit.setText("00:00:00.000")
-            self.out_edit.setText(timecode(duration_ms / 1000))
-            self.timeline.set_clip_range(0, duration_ms / 1000)
+        if self.selected and duration_ms > 0 and not self.user_adjusted_range and self.current_clip_index is None:
+            self.set_selection(0, duration_ms / 1000)
         self.update_clip_buttons()
 
     def position_changed(self, position_ms: int):
+        if self.preview_active:
+            if self.preview_seeking:
+                # QMediaPlayer seeks asynchronously. A position update from the OLD
+                # playback location may arrive after setPosition(start), including
+                # one beyond Out. Do not mistake that update for clip completion.
+                if self.preview_start_ms - 300 <= position_ms < self.preview_end_ms:
+                    self.preview_seeking = False
+            elif preview_finished(position_ms, self.preview_end_ms):
+                self.stop_clip_preview()
+                self.player.pause()
+                self.player.setPosition(self.preview_end_ms)
+                return
         self.position.setText(f"{timecode(position_ms / 1000)} / {timecode(self.player.duration() / 1000)}")
         if not self.timeline.isSliderDown():
             self.timeline.setValue(position_ms)
             if self._follow_playhead:
                 self.timeline.reveal(position_ms)
 
+    def seek_manually(self, position_ms: int):
+        if self.preview_active:
+            self.stop_clip_preview()
+        self.player.setPosition(position_ms)
+
     def toggle_playback(self):
+        # Ordinary Play returns to full-recording playback.
+        self.stop_clip_preview()
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
             self.player.play()
 
     def playback_changed(self, state):
-        self.play.setText("Pause" if state == QMediaPlayer.PlaybackState.PlayingState else "Play")
+        if self.preview_active and state == QMediaPlayer.PlaybackState.StoppedState:
+            self.stop_clip_preview()
+        self.play.setText("Pause recording" if state == QMediaPlayer.PlaybackState.PlayingState else "Play recording")
+
+    def stop_clip_preview(self):
+        self.preview_active = False
+        self.preview_start_ms = 0
+        self.preview_end_ms = 0
+        self.preview_seeking = False
+        if hasattr(self, 'preview'):
+            self.preview.setText('Play clip')
+
+    def toggle_clip_preview(self):
+        """Play/pause only the chosen clip, independently from full-video Play."""
+        if self.preview_active:
+            self.stop_clip_preview()
+            self.player.pause()
+            return
+        self.start_clip_preview()
+
+    def play_saved_clip(self, item):
+        """Double-click a saved clip to select and play it from the beginning."""
+        index = self.clips_list.row(item)
+        if not 0 <= index < len(self.clip_ranges):
+            return
+        if self.current_clip_index != index:
+            self.clips_list.setCurrentRow(index)  # calls choose_clip
+        self.start_clip_preview()
+
+    def start_clip_preview(self):
+        """Seek to In, play and stop at Out; never create/export a clip file."""
+        if not self.selected or not self.selected.available or self.export_active:
+            return
+        try:
+            start, end = self.current_range()
+        except ValueError as exc:
+            QMessageBox.warning(self, 'Cannot play clip',
+                                f'{exc}\n\nTry playing the full recording first. '
+                                'If it has no duration, check the recording format or codec.')
+            return
+        self.player.pause()
+        self.stop_clip_preview()
+        start_ms, end_ms = round(start * 1000), round(end * 1000)
+        self.preview_start_ms = start_ms
+        self.preview_end_ms = end_ms
+        self.preview_seeking = True
+        self.preview_active = True
+        self.preview.setText('Stop clip')
+        self._follow_playhead = True
+        self.player.setPosition(start_ms)
+        self.timeline.reveal(start_ms)
+        self.player.play()
+        self.detail_status.setText(f'Playing clip: {timecode(start)} to {timecode(end)}')
 
     def media_error(self, error, message):
         if error != QMediaPlayer.Error.NoError:
@@ -655,16 +786,38 @@ class LibraryWindow(QMainWindow):
             self.player.setPosition(round(target * 1000))
             self.timeline.reveal(round(self.selected.bookmarks[index] * 1000))
 
+    def play_bookmark(self, item):
+        """Double-click a bookmark to seek to its preroll and play normally."""
+        index = self.marks.row(item)
+        self.play_bookmark_index(index)
+
+    def play_timeline_bookmark(self, index: int):
+        self.play_bookmark_index(index)
+
+    def play_bookmark_index(self, index: int):
+        if not self.selected or not self.selected.available:
+            return
+        if not 0 <= index < len(self.selected.bookmarks):
+            return
+        # A bookmark is a navigational marker, not a clip boundary: playback
+        # should continue beyond the mark until the user pauses it.
+        self.stop_clip_preview()
+        if self.marks.currentRow() != index:
+            self.marks.setCurrentRow(index)
+        self.jump_bookmark(index)
+        self.player.play()
+        self.detail_status.setText(f'Playing from bookmark {index + 1}.')
+
     def select_timeline_bookmark(self, index: int):
-        # Selecting the list item triggers the same five-second preroll as clicking the flag.
+        # A single click seeks, a double-click also begins playback.
         self.marks.setCurrentRow(index)
         self.jump_bookmark(index)
 
     def change_timeline_zoom(self, value: int):
-        self._follow_playhead = True
-        self.zoom_label.setText(f'{value}×')
-        self.timeline.set_zoom(value, self.player.position())
-        self.timeline_scroll.setVisible(value > 1 and self.timeline.duration_ms > 0)
+        zoom = 2 ** value
+        self._follow_playhead = False  # Keep user's chosen zoom/pan until requested otherwise.
+        self.zoom_label.setText('Fit' if value == 0 else f'{zoom}×')
+        self.timeline.set_zoom(zoom, self.player.position())
 
     def pan_timeline(self, value: int):
         self._follow_playhead = False  # Manual panning must not snap back on playback.
@@ -681,6 +834,13 @@ class LibraryWindow(QMainWindow):
         self.timeline_scroll.setValue(round(10000 * self.timeline.view_start_ms / maximum) if maximum else 0)
         self.timeline_scroll.blockSignals(False)
         self.timeline_scroll.setVisible(self.timeline.zoom_factor > 1 and self.timeline.duration_ms > 0)
+        if hasattr(self, 'zoom_info'):
+            start = self.timeline.view_start_ms
+            end = min(self.timeline.duration_ms, start + self.timeline.visible_span_ms())
+            self.zoom_info.setText(
+                f'Visible: {timecode(start / 1000)} – {timecode(end / 1000)}'
+                f'   /   Total: {timecode(self.timeline.duration_ms / 1000)}'
+            )
 
     @staticmethod
     def thumbnail_placeholder() -> QIcon:
@@ -704,43 +864,83 @@ class LibraryWindow(QMainWindow):
                 process.waitForFinished(500)
             process.deleteLater()
 
-    def queue_thumbnails(self, recording: Recording):
+    @staticmethod
+    def _thumbnail_icon(path: Path) -> QIcon | None:
+        pixmap = QPixmap(str(path))
+        return QIcon(pixmap) if not pixmap.isNull() else None
+
+    def queue_thumbnails(self, recording: Recording | None):
+        """Generate both bookmark AND clip preview frames only while library is open.
+
+        Sequential short-lived FFmpeg workers avoid stalling the Qt event loop.
+        All jobs are invalidated when a different recording/clip collection loads.
+        """
+        self.cancel_thumbnails()
+        self._thumbnail_errors = []
+        self._thumbnail_loaded = 0
+        if recording is None or not recording.available:
+            self.thumbnail_status.setText('Previews unavailable: recording file missing.')
+            return
+        targets = ([('bookmark', i, seconds) for i, seconds in enumerate(recording.bookmarks)]
+                   + [('clip', i, clip_thumbnail_time(start, end))
+                      for i, (start, end) in enumerate(self.clip_ranges)])
+        self._thumbnail_total = len(targets)
+        if not targets:
+            self.thumbnail_status.setText('No bookmarks or clips to preview.')
+            return
         ffmpeg = find_ffmpeg()
-        if not ffmpeg or not recording.video or not recording.bookmarks:
-            if not ffmpeg and recording.bookmarks:
-                self.detail_status.setText('Bookmark thumbnails require FFmpeg; timecodes still work.')
+        if not ffmpeg:
+            self.thumbnail_status.setText(
+                'Thumbnails need FFmpeg. Run: winget install --id Gyan.FFmpeg -e '
+                '(restart dogears afterwards), or place ffmpeg.exe in the tools folder.')
             return
         try:
             self.thumbnail_dir.mkdir(parents=True, exist_ok=True)
             self._thumbnail_ffmpeg = ffmpeg
-            for index, seconds in enumerate(recording.bookmarks):
+            for kind, index, seconds in targets:
                 destination = self.thumbnail_dir / thumbnail_name(recording.video, seconds)
-                if destination.is_file() and destination.stat().st_size > 0:
-                    item = self.marks.item(index)
-                    if item:
-                        item.setIcon(QIcon(str(destination)))
+                icon = self._thumbnail_icon(destination) if destination.is_file() else None
+                widget = self.marks if kind == 'bookmark' else self.clips_list
+                item = widget.item(index)
+                if icon:
+                    if item is not None:
+                        item.setIcon(icon)
+                        self._thumbnail_loaded += 1
                 else:
-                    self._thumbnail_queue.append((self._thumbnail_epoch, index, recording.video, seconds, destination))
+                    destination.unlink(missing_ok=True)
+                    if item is not None:
+                        item.setIcon(self.thumbnail_placeholder())
+                    self._thumbnail_queue.append((self._thumbnail_epoch, kind, index,
+                                                 recording.video, thumbnail_seek_candidates(seconds),
+                                                 0, destination))
+            self.thumbnail_status.setText(
+                f'Previews (bookmarks + clips): {self._thumbnail_loaded}/{self._thumbnail_total} ready…')
             self._run_next_thumbnail()
-        except OSError:
-            self.detail_status.setText('Cannot write bookmark thumbnails to the Windows thumbnail cache.')
+        except OSError as exc:
+            self.thumbnail_status.setText(f'Cannot prepare thumbnail cache: {exc}')
 
     def _run_next_thumbnail(self):
         if self._thumbnail_process is not None or not self._thumbnail_queue:
+            if not self._thumbnail_queue and self._thumbnail_process is None and self._thumbnail_total:
+                message = f'Previews (bookmarks + clips): {self._thumbnail_loaded}/{self._thumbnail_total} ready.'
+                if self._thumbnail_errors:
+                    message += f' Preview issue: {self._thumbnail_errors[0][:240]}'
+                self.thumbnail_status.setText(message)
             return
-        epoch, index, source, seconds, destination = self._thumbnail_queue.popleft()
+        job = self._thumbnail_queue.popleft()
+        epoch, kind, index, source, seeks, attempt, destination = job
         if epoch != self._thumbnail_epoch:
+            QTimer.singleShot(0, self._run_next_thumbnail)
             return
-        temporary = destination.with_name(destination.stem + '.partial.jpg')
         process = QProcess(self)
         self._thumbnail_process = process
         process.finished.connect(
-            lambda exit_code, status, proc=process, job=(epoch, index, temporary, destination):
-                self._thumbnail_done(proc, job, exit_code, status))
+            lambda exit_code, status, proc=process, this_job=job:
+                self._thumbnail_done(proc, this_job, exit_code, status))
         process.errorOccurred.connect(
-            lambda error, proc=process, job=(epoch, index, temporary, destination):
-                self._thumbnail_failed(proc, job, error))
-        process.start(self._thumbnail_ffmpeg, thumbnail_args(source, seconds, temporary))
+            lambda error, proc=process, this_job=job:
+                self._thumbnail_failed(proc, this_job, error))
+        process.start(self._thumbnail_ffmpeg, thumbnail_pipe_args(source, seeks[attempt]))
 
     def _thumbnail_failed(self, process, job, error):
         if error == QProcess.ProcessError.FailedToStart:
@@ -750,47 +950,73 @@ class LibraryWindow(QMainWindow):
         if process is not self._thumbnail_process:
             return
         self._thumbnail_process = None
-        epoch, index, temporary, destination = job
-        if epoch == self._thumbnail_epoch and exit_code == 0 and temporary.is_file():
+        epoch, kind, index, source, seeks, attempt, destination = job
+        diagnostic = bytes(process.readAllStandardError()).decode('utf-8', errors='replace').strip()
+        # FFmpeg writes JPEG bytes to stdout instead of opening a Windows file
+        # path itself. Qt decodes those bytes and can cache the image afterwards.
+        # This works even when FFmpeg's image2 muxer cannot create a cache file.
+        jpeg_bytes = bytes(process.readAllStandardOutput())
+        pixmap = QPixmap()
+        pixmap_ok = (exit_code == 0 and bool(jpeg_bytes)
+                     and pixmap.loadFromData(jpeg_bytes, 'JPG'))
+        if epoch == self._thumbnail_epoch and pixmap_ok:
+            widget = self.marks if kind == 'bookmark' else self.clips_list
+            item = widget.item(index)
+            if item is not None:
+                item.setIcon(QIcon(pixmap))
+                self._thumbnail_loaded += 1
             try:
-                temporary.replace(destination)
-                item = self.marks.item(index)
-                if item is not None:
-                    item.setIcon(QIcon(str(destination)))
-            except OSError:
-                pass
-        else:
-            temporary.unlink(missing_ok=True)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if not pixmap.save(str(destination), 'JPEG', 88):
+                    self._thumbnail_errors.append(f'Preview displayed but cache could not be saved: {destination}')
+            except OSError as exc:
+                # A cache failure should never prevent the preview being shown.
+                self._thumbnail_errors.append(f'Preview displayed but cache could not be saved: {exc}')
+        if not pixmap_ok:
+            if epoch == self._thumbnail_epoch and attempt + 1 < len(seeks):
+                self._thumbnail_queue.appendleft((epoch, kind, index, source, seeks, attempt + 1, destination))
+            elif epoch == self._thumbnail_epoch:
+                self._thumbnail_errors.append(diagnostic or
+                    f'No decodable frame for {kind} {index + 1}; check source video codec and FFmpeg installation')
         process.deleteLater()
         QTimer.singleShot(0, self._run_next_thumbnail)
 
-    def mark_in(self):
-        if not self.export_active and self.selected and self.selected.available:
-            self.in_edit.setText(timecode(self.player.position() / 1000))
-            self.range_edited()
+    def set_selection(self, start: float | None, end: float | None):
+        """One source of truth: the two draggable handles on the timeline."""
+        self.selection_start, self.selection_end = start, end
+        self.timeline.set_clip_range(start, end)
+        self.update_selection_label()
 
-    def mark_out(self):
-        if not self.export_active and self.selected and self.selected.available:
-            self.out_edit.setText(timecode(self.player.position() / 1000))
-            self.range_edited()
+    def update_selection_label(self):
+        if self.selection_start is None or self.selection_end is None:
+            self.selection_label.setText('Selected range: —')
+        else:
+            self.selection_label.setText(
+                f'Selected range: {timecode(self.selection_start)} → {timecode(self.selection_end)}'
+                f'   ({timecode(self.selection_end-self.selection_start)})')
 
     def range_dragged(self, start: float, end: float):
-        self.in_edit.setText(timecode(start))
-        self.out_edit.setText(timecode(end))
+        self.stop_clip_preview()
+        self.set_selection(start, end)
         self.range_edited(save=False)
 
     def current_range(self) -> tuple[float, float]:
-        start, end = parse_timecode(self.in_edit.text()), parse_timecode(self.out_edit.text())
+        if self.selection_start is None or self.selection_end is None:
+            raise ValueError('Drag the two blue handles on the timeline to select a clip.')
+        start, end = self.selection_start, self.selection_end
         validate_range(start, end, self.player.duration() / 1000)
         return start, end
 
     def range_edited(self, save: bool = True):
         if self._showing_selection or self.export_active:
             return
+        if self.preview_active:
+            self.stop_clip_preview()
+            self.player.pause()
         self.user_adjusted_range = True
         try:
             start, end = self.current_range()
-            self.timeline.set_clip_range(start, end)
+            self.set_selection(start, end)
             if self.current_clip_index is not None:
                 self.clip_ranges[self.current_clip_index] = (start, end)
                 item = self.clips_list.item(self.current_clip_index)
@@ -800,9 +1026,10 @@ class LibraryWindow(QMainWindow):
                                  f'({timecode(end-start)})')
                 if save:
                     self.persist_clips()
-            self.detail_status.setText('Clip selection updated. Drag handles or press I/O at the playhead.')
+                    self.queue_thumbnails(self.selected)
+            self.detail_status.setText('Clip selection updated. Drag the blue handles to adjust it.')
         except ValueError:
-            self.detail_status.setText('Set a valid In/Out range inside the recording (minimum 0.1 sec).')
+            self.detail_status.setText('Select a range of at least 0.1 seconds within the recording.')
         self.update_clip_buttons()
 
     def refresh_clips(self):
@@ -810,8 +1037,11 @@ class LibraryWindow(QMainWindow):
         self.clips_list.blockSignals(True)
         self.clips_list.clear()
         for index, (start, end) in enumerate(self.clip_ranges, 1):
-            self.clips_list.addItem(f'{index:02d}    {timecode(start)} → {timecode(end)}'
-                                    f'    ({timecode(end-start)})')
+            item = QListWidgetItem(f'{index:02d}    {timecode(start)} → {timecode(end)}'
+                                   f'    ({timecode(end-start)})')
+            item.setSizeHint(QSize(210, 96))
+            item.setIcon(self.thumbnail_placeholder())
+            self.clips_list.addItem(item)
         self.clips_list.setCurrentRow(-1 if selected_index is None else selected_index)
         self.clips_list.blockSignals(False)
         self.update_clip_buttons()
@@ -825,6 +1055,9 @@ class LibraryWindow(QMainWindow):
             self.detail_status.setText(f'Could not save clip selections: {exc}')
 
     def choose_clip(self, index: int):
+        if self.preview_active:
+            self.player.pause()
+        self.stop_clip_preview()
         if index < 0 or index >= len(self.clip_ranges):
             self.current_clip_index = None
             self.update_clip_buttons()
@@ -832,9 +1065,7 @@ class LibraryWindow(QMainWindow):
         self.current_clip_index = index
         self._showing_selection = True
         start, end = self.clip_ranges[index]
-        self.in_edit.setText(timecode(start))
-        self.out_edit.setText(timecode(end))
-        self.timeline.set_clip_range(start, end)
+        self.set_selection(start, end)
         if self.timeline.zoom_factor > 1:
             self.timeline.set_view_start(start * 1000 - self.timeline.visible_span_ms() * 0.1)
         self.user_adjusted_range = True
@@ -845,6 +1076,9 @@ class LibraryWindow(QMainWindow):
     def new_selection(self):
         if self.export_active or not self.selected or not self.selected.available or self.player.duration() <= 0:
             return
+        if self.preview_active:
+            self.player.pause()
+            self.stop_clip_preview()
         self.current_clip_index = None
         self.clips_list.blockSignals(True)
         self.clips_list.setCurrentRow(-1)
@@ -853,10 +1087,8 @@ class LibraryWindow(QMainWindow):
         position = min(self.player.position() / 1000, max(0, duration - 0.1))
         start = max(0, position)
         end = min(duration, max(position + 10, 0.1))
-        self.in_edit.setText(timecode(start))
-        self.out_edit.setText(timecode(end))
-        self.timeline.set_clip_range(start, end)
-        self.detail_status.setText('New selection: drag handles or use I/O, then Add clip.')
+        self.set_selection(start, end)
+        self.detail_status.setText('New selection: drag blue handles, then click Add clip.')
         self.update_clip_buttons()
 
     def add_clip(self):
@@ -874,6 +1106,7 @@ class LibraryWindow(QMainWindow):
         self.current_clip_index = len(self.clip_ranges) - 1
         self.refresh_clips()
         self.persist_clips()
+        self.queue_thumbnails(self.selected)
         self.detail_status.setText(f'Added clip {len(self.clip_ranges)}. Choose New selection to make another.')
 
     def remove_clip(self):
@@ -886,6 +1119,7 @@ class LibraryWindow(QMainWindow):
         if self.current_clip_index is not None:
             self.choose_clip(self.current_clip_index)
         self.persist_clips()
+        self.queue_thumbnails(self.selected)
 
     def move_clip(self, delta: int):
         index = self.current_clip_index
@@ -896,12 +1130,12 @@ class LibraryWindow(QMainWindow):
         self.current_clip_index = index + delta
         self.refresh_clips()
         self.persist_clips()
+        self.queue_thumbnails(self.selected)
 
     def update_clip_buttons(self):
         valid_video = bool(self.selected and self.selected.available and self.player.duration() > 0)
         editable = valid_video and not self.export_active
-        for btn in (self.new_selection_button, self.set_in, self.set_out):
-            btn.setEnabled(editable)
+        self.new_selection_button.setEnabled(editable)
         try:
             valid_range = bool(editable and self.current_range())
         except ValueError:
@@ -912,6 +1146,7 @@ class LibraryWindow(QMainWindow):
         self.up_button.setEnabled(editable and index is not None and index > 0)
         self.down_button.setEnabled(editable and index is not None and index < len(self.clip_ranges) - 1)
         self.export.setEnabled(editable and bool(self.clip_ranges))
+        self.preview.setEnabled(valid_range)
 
     def open_video_folder(self):
         from PySide6.QtGui import QDesktopServices
@@ -956,6 +1191,8 @@ class LibraryWindow(QMainWindow):
             QMessageBox.warning(self, 'Invalid clips', str(exc))
             return
 
+        self.stop_clip_preview()
+        self.player.pause()
         mode = self.export_format.currentData()
         temp = None
         try:
@@ -1018,8 +1255,6 @@ class LibraryWindow(QMainWindow):
         self.table.setEnabled(False)
         self.refresh_button.setEnabled(False)
         self.clips_list.setEnabled(False)
-        self.in_edit.setEnabled(False)
-        self.out_edit.setEnabled(False)
         self.timeline.setEnabled(False)
         self.export_format.setEnabled(False)
         self.cancel.setVisible(True)
@@ -1104,8 +1339,6 @@ class LibraryWindow(QMainWindow):
         self.table.setEnabled(True)
         self.refresh_button.setEnabled(True)
         self.clips_list.setEnabled(True)
-        self.in_edit.setEnabled(True)
-        self.out_edit.setEnabled(True)
         self.timeline.setEnabled(True)
         self.export_format.setEnabled(True)
         self.update_clip_buttons()

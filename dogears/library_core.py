@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
@@ -138,12 +139,36 @@ def validate_range(start: float, end: float, duration: float) -> None:
 
 
 def find_ffmpeg() -> str | None:
-    """Find FFmpeg on PATH or in a local tools folder beside the project."""
-    exe = shutil.which("ffmpeg")
+    """Locate FFmpeg, including WinGet installs missing from a stale Windows PATH.
+
+    Only checked when opening the library/performing exports, not during games.
+    """
+    exe = shutil.which('ffmpeg')
     if exe:
         return exe
-    local = Path(__file__).resolve().parent.parent / "tools" / "ffmpeg.exe"
-    return str(local) if local.is_file() else None
+    root = Path(__file__).resolve().parent.parent
+    home = Path.home()
+    localappdata = Path(os.environ.get('LOCALAPPDATA', home / 'AppData' / 'Local'))
+    programdata = Path(os.environ.get('ProgramData', 'C:/ProgramData'))
+    candidates = [
+        root / 'tools' / 'ffmpeg.exe',
+        localappdata / 'Microsoft' / 'WinGet' / 'Links' / 'ffmpeg.exe',
+        programdata / 'chocolatey' / 'bin' / 'ffmpeg.exe',
+        Path('C:/ffmpeg/bin/ffmpeg.exe'),
+        Path('C:/Program Files/ffmpeg/bin/ffmpeg.exe'),
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    # WinGet Gyan.FFmpeg may not have created a shim yet. Search only the
+    # narrow package directory; don't recursively scan arbitrary user files.
+    packages = localappdata / 'Microsoft' / 'WinGet' / 'Packages'
+    if packages.is_dir():
+        for package in sorted(packages.glob('Gyan.FFmpeg_*')):
+            for binary in package.glob('ffmpeg-*/bin/ffmpeg.exe'):
+                if binary.is_file():
+                    return str(binary)
+    return None
 
 
 def export_arguments(video: Path, destination: Path, start: float, end: float) -> list[str]:
